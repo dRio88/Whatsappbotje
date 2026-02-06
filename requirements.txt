@@ -1,4 +1,4 @@
 flask
 twilio
-openai==0.28
 gunicorn
+openai==0.28
