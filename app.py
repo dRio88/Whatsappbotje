@@ -7,25 +7,33 @@ app = Flask(__name__)
 
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
+# Simpel geheugen per gebruiker (telefoonnummer)
+user_memory = {}
+
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     msg = request.form.get("Body")
+    from_number = request.form.get("From")  # WhatsApp-nummer van de gebruiker
 
+    # Haal bestaande context op of start een nieuwe
+    if from_number not in user_memory:
+        user_memory[from_number] = [
+            {"role": "system", "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent."}
+        ]
+
+    # Voeg het nieuwe bericht toe aan de context
+    user_memory[from_number].append({"role": "user", "content": msg})
+
+    # Vraag antwoord bij OpenAI
     response = openai.ChatCompletion.create(
         model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "Je bent een Grappige, korte, Nederlandstalige WhatsApp-assistent."
-            },
-            {
-                "role": "user",
-                "content": msg
-            }
-        ]
+        messages=user_memory[from_number]
     )
 
     reply = response.choices[0].message.content
+
+    # Voeg het AI-antwoord toe aan de context
+    user_memory[from_number].append({"role": "assistant", "content": reply})
 
     resp = MessagingResponse()
     resp.message(reply)
