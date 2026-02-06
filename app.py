@@ -2,57 +2,41 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import openai
 import os
-import random
 
 app = Flask(__name__)
 
-# OpenAI API Key vanuit environment variable
+# OpenAI API key instellen via environment variable
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
-# Chat geheugen per gebruiker (telefoonnummer)
+# Simpel geheugen per gebruiker (phone number)
 chat_memory = {}
-
-# Helper functie om systeem prompt af te wisselen
-def system_prompt():
-    prompts = [
-        "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent. Gebruik emoji en maak het leuk.",
-        "Je bent een slimme, korte WhatsApp-bot die humor toevoegt.",
-        "Je bent een creatieve WhatsApp-assistent, Nederlands, met grappige en vlotte reacties."
-    ]
-    return random.choice(prompts)
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    user_number = request.form.get("From")  # telefoonnummer van de gebruiker
-    msg = request.form.get("Body")  # bericht van de gebruiker
+    user_number = request.form.get("From")  # unieke gebruiker
+    msg = request.form.get("Body")
 
-    # Zorg dat geheugen bestaat voor deze gebruiker
+    # initialiseer geheugen voor deze gebruiker als nieuw
     if user_number not in chat_memory:
-        chat_memory[user_number] = []
+        chat_memory[user_number] = [
+            {"role": "system", "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent."}
+        ]
 
-    # Voeg gebruiker bericht toe aan geheugen
-    chat_memory[user_number].append({
-        "role": "user",
-        "content": msg
-    })
+    # voeg het nieuwe bericht toe
+    chat_memory[user_number].append({"role": "user", "content": msg})
 
-    # OpenAI ChatCompletion call
+    # OpenAI call
     response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt()}
-        ] + chat_memory[user_number]
+        model="gpt-4o-mini",  # je kunt ook gpt-5-nano proberen
+        messages=chat_memory[user_number]
     )
 
     reply = response.choices[0].message.content
 
-    # Voeg assistant antwoord toe aan geheugen
-    chat_memory[user_number].append({
-        "role": "assistant",
-        "content": reply
-    })
+    # voeg antwoord toe aan geheugen
+    chat_memory[user_number].append({"role": "assistant", "content": reply})
 
-    # Stuur antwoord terug naar WhatsApp
+    # terugsturen naar WhatsApp
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
