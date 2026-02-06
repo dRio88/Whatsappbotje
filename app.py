@@ -22,11 +22,7 @@ def get_user_history(user_number):
 
 
 def save_user_message(user_number, role, content):
-    db.insert({
-        "user": user_number,
-        "role": role,
-        "content": content
-    })
+    db.insert({"user": user_number, "role": role, "content": content})
 
 
 # --------- WHATSAPP ENDPOINT ---------
@@ -35,26 +31,44 @@ def whatsapp():
     user_number = request.form.get("From")
     msg = request.form.get("Body", "").strip()
 
-    # Altijd een response-object maken
     resp = MessagingResponse()
 
-    # Veiligheid: leeg bericht
+    # Veiligheid: lege berichten
     if not msg:
         resp.message("🤖 Ik heb geen bericht ontvangen.")
         return str(resp)
 
-    # --------- STOCK DETECTIE ---------
-    # Match AAPL, $AAPL, MSFT, TSLA, enz.
+    # --- STOCK DETECTIE ---
+    # Zoek ticker in bericht
     ticker_match = re.search(r'\$?[A-Z]{1,5}', msg.upper())
     ticker = ticker_match.group().replace("$", "") if ticker_match else None
 
     if ticker:
         try:
             data = yf.Ticker(ticker).history(period="1d")
-
             if not data.empty:
                 last_price = data["Close"].iloc[-1]
-                reply = f"📈 {ticker} staat op ${last_price:.2f}"
+
+                # Check of gebruiker "analyse" vraagt
+                if "ANALYSE" in msg.upper():
+                    # Gebruik OpenAI om een korte analyse te maken
+                    prompt = (
+                        f"Geef een korte, Nederlandstalige analyse van de huidige koers van {ticker} "
+                        f"die nu op ${last_price:.2f} staat. Maximaal 2 zinnen, informeel en begrijpelijk."
+                    )
+                    analysis = client.chat.completions.create(
+                        model="gpt-5-nano",
+                        messages=[
+                            {"role": "system", "content": "Je bent een korte, grappige financiële assistent."},
+                            {"role": "user", "content": prompt}
+                        ]
+                    ).choices[0].message.content
+
+                    reply = f"📈 {ticker} staat op ${last_price:.2f}\n💡 Analyse: {analysis}"
+
+                else:
+                    reply = f"📈 {ticker} staat op ${last_price:.2f}"
+
             else:
                 reply = f"❌ Geen koersdata gevonden voor {ticker}"
 
@@ -62,7 +76,7 @@ def whatsapp():
             reply = "⚠️ Er ging iets mis bij het ophalen van de beursprijs."
 
     else:
-        # --------- CHAT MET CONTEXT ---------
+        # --- CHAT MET CONTEXT ---
         history = get_user_history(user_number)
         history.append({"role": "user", "content": msg})
 
@@ -71,17 +85,13 @@ def whatsapp():
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Je bent een grappige, korte, Nederlandstalige "
-                        "WhatsApp-assistent die context onthoudt."
-                    )
+                    "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent die context onthoudt."
                 }
             ] + history
         )
 
         reply = response.choices[0].message.content
 
-        # Context opslaan
         save_user_message(user_number, "user", msg)
         save_user_message(user_number, "assistant", reply)
 
