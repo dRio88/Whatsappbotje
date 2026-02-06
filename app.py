@@ -1,54 +1,58 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-import openai
+from openai import OpenAI
 import os
 import yfinance as yf
+from tinydb import TinyDB, Query
 
 app = Flask(__name__)
 
-openai.api_key = os.environ.get("OPENAI_API_KEY")
+# OpenAI client
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-chat_memory = {}
+# Chat memory database
+db = TinyDB('chat_memory.json')
+
+def get_user_history(user_number):
+    records = db.search(Query().user == user_number)
+    return [{"role": r["role"], "content": r["content"]} for r in records]
+
+def save_user_message(user_number, role, content):
+    db.insert({"user": user_number, "role": role, "content": content})
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     user_number = request.form.get("From")
     msg = request.form.get("Body")
 
-    if user_number not in chat_memory:
-        chat_memory[user_number] = [
-            {"role": "system", "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent."}
-        ]
+    # Check for stock queries like "AAPL" or "prijs AAPL"
+    if "AAPL" in msg.upper() or "prijs" in msg.lower():
+        stock = "AAPL"
+        data = yf.Ticker(stock).history(period="1d")
+        if not data.empty:
+            last_price = data['Close'][-1]
+            reply = f"De laatste slotprijs van {stock} is ${last_price:.2f}"
+        else:
+            reply = "Sorry, ik kan de beursprijs nu niet ophalen."
+    else:
+        # Haal eerdere context op
+        history = get_user_history(user_number)
 
-    chat_memory[user_number].append({"role": "user", "content": msg})
+        # Voeg huidige vraag toe
+        history.append({"role": "user", "content": msg})
 
-    # Check op aandelen commando: bv. "AAPL prijs"
-    if "prijs" in msg.lower():
-        words = msg.split()
-        ticker = None
-        for w in words:
-            if w.isupper() and len(w) <= 5:  # simpele detectie van tickers
-                ticker = w
-                break
-        if ticker:
-            try:
-                stock = yf.Ticker(ticker)
-                price = stock.info["regularMarketPrice"]
-                reply = f"De huidige prijs van {ticker} is ${price}"
-            except Exception as e:
-                reply = f"Sorry, kon de prijs van {ticker} niet ophalen."
-            resp = MessagingResponse()
-            resp.message(reply)
-            return str(resp)
+        # OpenAI chat call
+        response = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[
+                {"role": "system", "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent die context onthoudt."}
+            ] + history
+        )
+        reply = response.choices[0].message.content
 
-    # Anders gebruik OpenAI zoals voorheen
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=chat_memory[user_number]
-    )
-
-    reply = response.choices[0].message.content
-    chat_memory[user_number].append({"role": "assistant", "content": reply})
+        # Sla gebruiker + bot antwoord op
+        save_user_message(user_number, "user", msg)
+        save_user_message(user_number, "assistant", reply)
 
     resp = MessagingResponse()
     resp.message(reply)
