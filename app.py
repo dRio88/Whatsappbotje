@@ -14,6 +14,8 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 # Chat memory database
 db = TinyDB("chat_memory.json")
 
+# --------- WHITELIST VAN TICKERS ---------
+VALID_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL", "AMZN"]
 
 # --------- MEMORY HELPERS ---------
 def get_user_history(user_number):
@@ -39,9 +41,12 @@ def whatsapp():
         return str(resp)
 
     # --- STOCK DETECTIE ---
-    # Zoek ticker in bericht
     ticker_match = re.search(r'\$?[A-Z]{1,5}', msg.upper())
     ticker = ticker_match.group().replace("$", "") if ticker_match else None
+
+    # Check of ticker in whitelist staat
+    if ticker not in VALID_TICKERS:
+        ticker = None
 
     if ticker:
         try:
@@ -51,7 +56,6 @@ def whatsapp():
 
                 # Check of gebruiker "analyse" vraagt
                 if "ANALYSE" in msg.upper():
-                    # Gebruik OpenAI om een korte analyse te maken
                     prompt = (
                         f"Geef een korte, Nederlandstalige analyse van de huidige koers van {ticker} "
                         f"die nu op ${last_price:.2f} staat. Maximaal 2 zinnen, informeel en begrijpelijk."
