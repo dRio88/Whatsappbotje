@@ -5,14 +5,21 @@ import yfinance as yf
 import pandas as pd
 import psycopg2
 import os
-import json
 from datetime import datetime
+import threading
+import time
 
 # ---------------- CONFIG ----------------
 app = Flask(__name__)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 db = psycopg2.connect(os.environ["DATABASE_URL"])
 db.autocommit = True
+
+# Pad naar CSV voor automatische import
+ETORO_CSV_PATH = "etoro_portfolio.csv"  # Pas aan naar je CSV pad
+
+# Interval voor automatische import (in seconden)
+AUTO_IMPORT_INTERVAL = 24 * 60 * 60  # 24 uur
 
 # ---------------- DATABASE ----------------
 def init_db():
@@ -76,6 +83,19 @@ def import_etoro_csv(user_id, file):
         add_to_portfolio(user_id, ticker, shares)
 
     print(f"Portfolio succesvol bijgewerkt voor {user_id}!")
+
+def auto_import_etoro():
+    """Automatische dagelijkse import van CSV voor alle users"""
+    while True:
+        try:
+            # Hier kun je user_id dynamisch instellen of een lijst van users importeren
+            user_id = "user_etoro"  # Voor automatische import, kan aangepast worden
+            with open(ETORO_CSV_PATH, "r") as f:
+                import_etoro_csv(user_id, f)
+            print(f"[Auto-import] Portfolio bijgewerkt voor {user_id}")
+        except Exception as e:
+            print(f"[Auto-import] Fout: {e}")
+        time.sleep(AUTO_IMPORT_INTERVAL)
 
 # ---------------- MARKET DATA ----------------
 def get_technical_data(ticker):
@@ -171,7 +191,7 @@ def get_history(user, limit=10):
             "SELECT user_msg, bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
             (user, limit)
         )
-        return c.fetchall()[::-1]  # Oudste eerst
+        return c.fetchall()[::-1]
 
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
@@ -181,7 +201,6 @@ def whatsapp():
 
     reply = ""
 
-    # ---- COMMANDS ----
     if msg.lower().startswith("koop"):
         _, ticker, shares = msg.split()
         add_to_portfolio(user, ticker.upper(), float(shares))
@@ -228,8 +247,8 @@ def import_etoro():
         return "Geen bestand geselecteerd", 400
 
     try:
-        # Gebruik user_id uit formulier, of fallback naar 'user_etoro'
-        user_id = request.form.get("user_id", "user_etoro")
+        # Gebruik WhatsApp nummer als user_id indien beschikbaar
+        user_id = request.form.get("from_whatsapp", "user_etoro")
         import_etoro_csv(user_id, file)
         return f"Portfolio succesvol bijgewerkt voor {user_id}!", 200
     except Exception as e:
@@ -243,6 +262,12 @@ def alerts():
         print(f"ALERT → {user}: {ticker} RSI {rsi}")
     return "ok"
 
+# ---------------- AUTOMATISCHE CSV IMPORT ----------------
+def start_auto_import():
+    thread = threading.Thread(target=auto_import_etoro, daemon=True)
+    thread.start()
+
 # ---------------- START ----------------
 if __name__ == "__main__":
+    start_auto_import()  # start dagelijkse CSV-import in background
     app.run()
