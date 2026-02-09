@@ -1,16 +1,19 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+from openai import OpenAI
+import yfinance as yf
 import pandas as pd
+import numpy as np
 import psycopg2
 import os
-import yfinance as yf
+import json
 from datetime import datetime
 
+# ---------------- CONFIG ----------------
 app = Flask(__name__)
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 db = psycopg2.connect(os.environ["DATABASE_URL"])
 db.autocommit = True
-
-MAX_LEN = 1500  # max chars per WhatsApp bericht
 
 # ---------------- DATABASE ----------------
 def init_db():
@@ -19,8 +22,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS portfolios (
             user_id TEXT,
             ticker TEXT,
-            shares FLOAT,
-            PRIMARY KEY(user_id, ticker)
+            shares FLOAT
+        );
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            user_id TEXT,
+            ticker TEXT,
+            rsi_threshold FLOAT
         );
         """)
         c.execute("""
@@ -31,70 +40,132 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         );
         """)
+
 init_db()
-
-# ---------------- PORTFOLIO ----------------
-def add_to_portfolio(user, ticker, shares):
-    with db.cursor() as c:
-        c.execute("""
-            INSERT INTO portfolios(user_id, ticker, shares)
-            VALUES(%s,%s,%s)
-            ON CONFLICT(user_id, ticker)
-            DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
-        """, (user, ticker, shares))
-
-def get_portfolio(user):
-    with db.cursor() as c:
-        c.execute("SELECT ticker, shares FROM portfolios WHERE user_id=%s", (user,))
-        return c.fetchall()
-
-# ---------------- CSV IMPORT ----------------
-def import_csv_for_user(user_id, file):
-    df = pd.read_csv(file)
-    if not all(col in df.columns for col in ['Ticker','Shares']):
-        raise ValueError("CSV moet kolommen 'Ticker' en 'Shares' bevatten")
-    for _, row in df.iterrows():
-        ticker = str(row['Ticker']).strip().upper()
-        shares = float(row['Shares'])
-        add_to_portfolio(user_id, ticker, shares)
-
-# ---------------- CHAT HISTORY ----------------
-def add_history(user, user_msg, bot_msg):
-    with db.cursor() as c:
-        c.execute("INSERT INTO history(user_id,user_msg,bot_msg) VALUES(%s,%s,%s)",
-                  (user, user_msg, bot_msg))
 
 # ---------------- MARKET DATA ----------------
 def get_technical_data(ticker):
     df = yf.Ticker(ticker).history(period="3mo")
-    if df.empty: return None
+    if df.empty:
+        return None
+
     close = df["Close"]
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    rsi = 100 - (100/(1+rs))
+    rsi = 100 - (100 / (1 + rs))
+
     return {
-        "price": round(close.iloc[-1],2),
-        "rsi": round(rsi.iloc[-1],1),
-        "trend": "bullish" if close.iloc[-1]>close.mean() else "bearish"
+        "price": round(close.iloc[-1], 2),
+        "rsi": round(rsi.iloc[-1], 1),
+        "trend": "bullish" if close.iloc[-1] > close.mean() else "bearish"
     }
 
-# ---------------- HELPER: SPLIT BERICHT ----------------
-def send_long_message(resp, text):
-    """Verdeel lange tekst in meerdere WhatsApp-berichten"""
-    for i in range(0, len(text), MAX_LEN):
-        resp.message(text[i:i+MAX_LEN])
+# ---------------- OPENAI ----------------
+def ask_gpt(user, message, market=None):
+    system = """
+Je bent een professionele beleggingsassistent.
+Leg duidelijk, praktisch en begrijpelijk uit.
+Geen financieel advies.
+Gebruik marktdata indien beschikbaar.
+"""
+
+    context = ""
+    if market:
+        context = f"""
+Marktdata:
+Prijs: {market['price']}
+RSI: {market['rsi']}
+Trend: {market['trend']}
+"""
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "assistant", "content": context},
+        {"role": "user", "content": message}
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages
+    )
+
+    return response.choices[0].message.content
+
+# ---------------- PORTFOLIO ----------------
+def add_to_portfolio(user, ticker, shares):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO portfolios VALUES (%s,%s,%s)",
+            (user, ticker, shares)
+        )
+
+def get_portfolio(user):
+    with db.cursor() as c:
+        c.execute(
+            "SELECT ticker, shares FROM portfolios WHERE user_id=%s",
+            (user,)
+        )
+        return c.fetchall()
+
+# ---------------- ALERTS ----------------
+def add_alert(user, ticker, rsi):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO alerts VALUES (%s,%s,%s)",
+            (user, ticker, rsi)
+        )
+
+def check_alerts():
+    with db.cursor() as c:
+        c.execute("SELECT user_id, ticker, rsi_threshold FROM alerts")
+        alerts = c.fetchall()
+
+    triggered = []
+    for user, ticker, threshold in alerts:
+        data = get_technical_data(ticker)
+        if data and data["rsi"] < threshold:
+            triggered.append((user, ticker, data["rsi"]))
+    return triggered
+
+# ---------------- DAILY BRIEF ----------------
+def daily_brief():
+    tickers = ["AAPL", "MSFT", "SPY", "BTC-USD"]
+    brief = "📊 Dagelijkse Marktupdate\n\n"
+    for t in tickers:
+        d = get_technical_data(t)
+        if d:
+            brief += f"{t}: ${d['price']} | RSI {d['rsi']} | {d['trend']}\n"
+    return brief
+
+# ---------------- CHAT HISTORY ----------------
+def add_history(user, user_msg, bot_msg):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO history (user_id, user_msg, bot_msg) VALUES (%s,%s,%s)",
+            (user, user_msg, bot_msg)
+        )
+
+def get_history(user, limit=10):
+    with db.cursor() as c:
+        c.execute(
+            "SELECT user_msg, bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            (user, limit)
+        )
+        return c.fetchall()[::-1]  # Oudste eerst
 
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     msg = request.form.get("Body").strip()
-    user = request.form.get("From")  # WhatsApp nummer wordt user_id
+    user = request.form.get("From")
 
     reply = ""
 
+    # ---- COMMANDS ----
     if msg.lower().startswith("koop"):
+        # koop AAPL 5
         _, ticker, shares = msg.split()
         add_to_portfolio(user, ticker.upper(), float(shares))
         reply = f"✅ Toegevoegd: {shares} aandelen {ticker.upper()}"
@@ -109,6 +180,7 @@ def whatsapp():
                 reply += f"- {t}: {s} aandelen\n"
 
     elif "waarschuw" in msg.lower():
+        # waarschuw AAPL 30
         parts = msg.split()
         ticker = parts[-2].upper()
         rsi = float(parts[-1])
@@ -119,32 +191,25 @@ def whatsapp():
         reply = daily_brief()
 
     else:
+        # normale chat / analyse
         ticker = msg.split()[-1].upper()
         market = get_technical_data(ticker)
         reply = ask_gpt(user, msg, market)
 
+    # Opslaan in Postgres in plaats van Redis
     add_history(user, msg, reply)
 
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
-# ---------------- CSV UPLOAD ----------------
-@app.route("/import-etoro", methods=["POST"])
-def import_etoro():
-    if "file" not in request.files or "from_whatsapp" not in request.form:
-        return "Bestand en from_whatsapp verplicht", 400
-
-    file = request.files["file"]
-    user_id = request.form["from_whatsapp"]
-    if file.filename == "":
-        return "Geen bestand geselecteerd", 400
-
-    try:
-        import_csv_for_user(user_id, file)
-        return f"✅ Portfolio bijgewerkt voor {user_id}", 200
-    except Exception as e:
-        return f"Fout bij import: {e}", 500
+# ---------------- ALERT CRON ENDPOINT ----------------
+@app.route("/check-alerts")
+def alerts():
+    triggered = check_alerts()
+    for user, ticker, rsi in triggered:
+        print(f"ALERT → {user}: {ticker} RSI {rsi}")
+    return "ok"
 
 # ---------------- START ----------------
 if __name__ == "__main__":
