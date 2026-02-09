@@ -4,7 +4,6 @@ from openai import OpenAI
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import redis
 import psycopg2
 import os
 import json
@@ -13,8 +12,6 @@ from datetime import datetime
 # ---------------- CONFIG ----------------
 app = Flask(__name__)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-redis_client = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 db = psycopg2.connect(os.environ["DATABASE_URL"])
 db.autocommit = True
 
@@ -33,6 +30,14 @@ def init_db():
             user_id TEXT,
             ticker TEXT,
             rsi_threshold FLOAT
+        );
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            user_id TEXT,
+            user_msg TEXT,
+            bot_msg TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
         );
         """)
 
@@ -134,16 +139,27 @@ def daily_brief():
             brief += f"{t}: ${d['price']} | RSI {d['rsi']} | {d['trend']}\n"
     return brief
 
+# ---------------- CHAT HISTORY ----------------
+def add_history(user, user_msg, bot_msg):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO history (user_id, user_msg, bot_msg) VALUES (%s,%s,%s)",
+            (user, user_msg, bot_msg)
+        )
+
+def get_history(user, limit=10):
+    with db.cursor() as c:
+        c.execute(
+            "SELECT user_msg, bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            (user, limit)
+        )
+        return c.fetchall()[::-1]  # Oudste eerst
+
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     msg = request.form.get("Body").strip()
     user = request.form.get("From")
-
-    # geheugen via Redis
-    history_key = f"history:{user}"
-    history = redis_client.get(history_key)
-    history = json.loads(history) if history else []
 
     reply = ""
 
@@ -180,8 +196,8 @@ def whatsapp():
         market = get_technical_data(ticker)
         reply = ask_gpt(user, msg, market)
 
-    history.append({"user": msg, "bot": reply})
-    redis_client.set(history_key, json.dumps(history[-10:]))
+    # Opslaan in Postgres in plaats van Redis
+    add_history(user, msg, reply)
 
     resp = MessagingResponse()
     resp.message(reply)
