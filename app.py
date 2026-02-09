@@ -1,109 +1,200 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
-import os
-import re
 import yfinance as yf
-from tinydb import TinyDB, Query
+import pandas as pd
+import numpy as np
+import redis
+import psycopg2
+import os
+import json
+from datetime import datetime
 
+# ---------------- CONFIG ----------------
 app = Flask(__name__)
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# OpenAI client
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+redis_client = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+db = psycopg2.connect(os.environ["DATABASE_URL"])
+db.autocommit = True
 
-# Chat memory database
-db = TinyDB("chat_memory.json")
+# ---------------- DATABASE ----------------
+def init_db():
+    with db.cursor() as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS portfolios (
+            user_id TEXT,
+            ticker TEXT,
+            shares FLOAT
+        );
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            user_id TEXT,
+            ticker TEXT,
+            rsi_threshold FLOAT
+        );
+        """)
 
-# --------- WHITELIST VAN TICKERS ---------
-VALID_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "GOOGL", "AMZN"]
+init_db()
 
-# --------- MEMORY HELPERS ---------
-def get_user_history(user_number):
-    records = db.search(Query().user == user_number)
-    return [{"role": r["role"], "content": r["content"]} for r in records]
+# ---------------- MARKET DATA ----------------
+def get_technical_data(ticker):
+    df = yf.Ticker(ticker).history(period="3mo")
+    if df.empty:
+        return None
 
+    close = df["Close"]
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+    rsi = 100 - (100 / (1 + rs))
 
-def save_user_message(user_number, role, content):
-    db.insert({"user": user_number, "role": role, "content": content})
+    return {
+        "price": round(close.iloc[-1], 2),
+        "rsi": round(rsi.iloc[-1], 1),
+        "trend": "bullish" if close.iloc[-1] > close.mean() else "bearish"
+    }
 
+# ---------------- OPENAI ----------------
+def ask_gpt(user, message, market=None):
+    system = """
+Je bent een professionele beleggingsassistent.
+Leg duidelijk, praktisch en begrijpelijk uit.
+Geen financieel advies.
+Gebruik marktdata indien beschikbaar.
+"""
 
-# --------- WHATSAPP ENDPOINT ---------
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    user_number = request.form.get("From")
-    msg = request.form.get("Body", "").strip()
+    context = ""
+    if market:
+        context = f"""
+Marktdata:
+Prijs: {market['price']}
+RSI: {market['rsi']}
+Trend: {market['trend']}
+"""
 
-    resp = MessagingResponse()
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "assistant", "content": context},
+        {"role": "user", "content": message}
+    ]
 
-    # Veiligheid: lege berichten
-    if not msg:
-        resp.message("🤖 Ik heb geen bericht ontvangen.")
-        return str(resp)
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages
+    )
 
-    # --- STOCK DETECTIE ---
-    ticker_match = re.search(r'\$?[A-Z]{1,5}', msg.upper())
-    ticker = ticker_match.group().replace("$", "") if ticker_match else None
+    return response.choices[0].message.content
 
-    # Check of ticker in whitelist staat
-    if ticker not in VALID_TICKERS:
-        ticker = None
-
-    if ticker:
-        try:
-            data = yf.Ticker(ticker).history(period="1d")
-            if not data.empty:
-                last_price = data["Close"].iloc[-1]
-
-                # Check of gebruiker "analyse" vraagt
-                if "ANALYSE" in msg.upper():
-                    prompt = (
-                        f"Geef een korte, Nederlandstalige analyse van de huidige koers van {ticker} "
-                        f"die nu op ${last_price:.2f} staat. Maximaal 2 zinnen, informeel en begrijpelijk."
-                    )
-                    analysis = client.chat.completions.create(
-                        model="gpt-5-nano",
-                        messages=[
-                            {"role": "system", "content": "Je bent een korte, grappige financiële assistent."},
-                            {"role": "user", "content": prompt}
-                        ]
-                    ).choices[0].message.content
-
-                    reply = f"📈 {ticker} staat op ${last_price:.2f}\n💡 Analyse: {analysis}"
-
-                else:
-                    reply = f"📈 {ticker} staat op ${last_price:.2f}"
-
-            else:
-                reply = f"❌ Geen koersdata gevonden voor {ticker}"
-
-        except Exception as e:
-            reply = "⚠️ Er ging iets mis bij het ophalen van de beursprijs."
-
-    else:
-        # --- CHAT MET CONTEXT ---
-        history = get_user_history(user_number)
-        history.append({"role": "user", "content": msg})
-
-        response = client.chat.completions.create(
-            model="gpt-5-nano",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Je bent een grappige, korte, Nederlandstalige WhatsApp-assistent die context onthoudt."
-                }
-            ] + history
+# ---------------- PORTFOLIO ----------------
+def add_to_portfolio(user, ticker, shares):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO portfolios VALUES (%s,%s,%s)",
+            (user, ticker, shares)
         )
 
-        reply = response.choices[0].message.content
+def get_portfolio(user):
+    with db.cursor() as c:
+        c.execute(
+            "SELECT ticker, shares FROM portfolios WHERE user_id=%s",
+            (user,)
+        )
+        return c.fetchall()
 
-        save_user_message(user_number, "user", msg)
-        save_user_message(user_number, "assistant", reply)
+# ---------------- ALERTS ----------------
+def add_alert(user, ticker, rsi):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO alerts VALUES (%s,%s,%s)",
+            (user, ticker, rsi)
+        )
 
+def check_alerts():
+    with db.cursor() as c:
+        c.execute("SELECT user_id, ticker, rsi_threshold FROM alerts")
+        alerts = c.fetchall()
+
+    triggered = []
+    for user, ticker, threshold in alerts:
+        data = get_technical_data(ticker)
+        if data and data["rsi"] < threshold:
+            triggered.append((user, ticker, data["rsi"]))
+    return triggered
+
+# ---------------- DAILY BRIEF ----------------
+def daily_brief():
+    tickers = ["AAPL", "MSFT", "SPY", "BTC-USD"]
+    brief = "📊 Dagelijkse Marktupdate\n\n"
+    for t in tickers:
+        d = get_technical_data(t)
+        if d:
+            brief += f"{t}: ${d['price']} | RSI {d['rsi']} | {d['trend']}\n"
+    return brief
+
+# ---------------- WHATSAPP ----------------
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp():
+    msg = request.form.get("Body").strip()
+    user = request.form.get("From")
+
+    # geheugen via Redis
+    history_key = f"history:{user}"
+    history = redis_client.get(history_key)
+    history = json.loads(history) if history else []
+
+    reply = ""
+
+    # ---- COMMANDS ----
+    if msg.lower().startswith("koop"):
+        # koop AAPL 5
+        _, ticker, shares = msg.split()
+        add_to_portfolio(user, ticker.upper(), float(shares))
+        reply = f"✅ Toegevoegd: {shares} aandelen {ticker.upper()}"
+
+    elif msg.lower().startswith("portfolio"):
+        pf = get_portfolio(user)
+        if not pf:
+            reply = "📂 Je portfolio is leeg."
+        else:
+            reply = "📂 Je portfolio:\n"
+            for t, s in pf:
+                reply += f"- {t}: {s} aandelen\n"
+
+    elif "waarschuw" in msg.lower():
+        # waarschuw AAPL 30
+        parts = msg.split()
+        ticker = parts[-2].upper()
+        rsi = float(parts[-1])
+        add_alert(user, ticker, rsi)
+        reply = f"⏰ Alert ingesteld: {ticker} bij RSI < {rsi}"
+
+    elif msg.lower() == "brief":
+        reply = daily_brief()
+
+    else:
+        # normale chat / analyse
+        ticker = msg.split()[-1].upper()
+        market = get_technical_data(ticker)
+        reply = ask_gpt(user, msg, market)
+
+    history.append({"user": msg, "bot": reply})
+    redis_client.set(history_key, json.dumps(history[-10:]))
+
+    resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
+# ---------------- ALERT CRON ENDPOINT ----------------
+@app.route("/check-alerts")
+def alerts():
+    triggered = check_alerts()
+    for user, ticker, rsi in triggered:
+        print(f"ALERT → {user}: {ticker} RSI {rsi}")
+    return "ok"
 
-# --------- APP START ---------
+# ---------------- START ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run()
