@@ -15,10 +15,8 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 db = psycopg2.connect(os.environ["DATABASE_URL"])
 db.autocommit = True
 
-# Pad naar CSV voor automatische import
-ETORO_CSV_PATH = "etoro_portfolio.csv"  # Pas aan naar je CSV pad
-
-# Interval voor automatische import (in seconden)
+# Pad naar CSV voor automatische import (optioneel)
+ETORO_CSV_PATH = "etoro_portfolio.csv"
 AUTO_IMPORT_INTERVAL = 24 * 60 * 60  # 24 uur
 
 # ---------------- DATABASE ----------------
@@ -71,7 +69,7 @@ def get_portfolio(user):
 
 # ---------------- ETORO CSV INTEGRATIE ----------------
 def import_etoro_csv(user_id, file):
-    """Leest Etoro CSV en update portfolio in Postgres"""
+    """Leest CSV en update portfolio voor de opgegeven gebruiker"""
     df = pd.read_csv(file)
     required_cols = ['Ticker', 'Shares']
     if not all(col.strip() in df.columns for col in required_cols):
@@ -85,16 +83,15 @@ def import_etoro_csv(user_id, file):
     print(f"Portfolio succesvol bijgewerkt voor {user_id}!")
 
 def auto_import_etoro():
-    """Automatische dagelijkse import van CSV voor alle users"""
+    """Dagelijkse automatische import van CSV voor een vaste user (optioneel)"""
     while True:
         try:
-            # Hier kun je user_id dynamisch instellen of een lijst van users importeren
-            user_id = "user_etoro"  # Voor automatische import, kan aangepast worden
+            user_id = "user_etoro"
             with open(ETORO_CSV_PATH, "r") as f:
                 import_etoro_csv(user_id, f)
             print(f"[Auto-import] Portfolio bijgewerkt voor {user_id}")
         except Exception as e:
-            print(f"[Auto-import] Fout: {e}")
+            print(f"[Auto-import] Fout bij auto-import: {e}")
         time.sleep(AUTO_IMPORT_INTERVAL)
 
 # ---------------- MARKET DATA ----------------
@@ -124,7 +121,6 @@ Leg duidelijk, praktisch en begrijpelijk uit.
 Geen financieel advies.
 Gebruik marktdata indien beschikbaar.
 """
-
     context = ""
     if market:
         context = f"""
@@ -133,7 +129,6 @@ Prijs: {market['price']}
 RSI: {market['rsi']}
 Trend: {market['trend']}
 """
-
     messages = [
         {"role": "system", "content": system},
         {"role": "assistant", "content": context},
@@ -144,7 +139,6 @@ Trend: {market['trend']}
         model="gpt-4.1-mini",
         messages=messages
     )
-
     return response.choices[0].message.content
 
 # ---------------- ALERTS ----------------
@@ -185,19 +179,11 @@ def add_history(user, user_msg, bot_msg):
             (user, user_msg, bot_msg)
         )
 
-def get_history(user, limit=10):
-    with db.cursor() as c:
-        c.execute(
-            "SELECT user_msg, bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-            (user, limit)
-        )
-        return c.fetchall()[::-1]
-
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     msg = request.form.get("Body").strip()
-    user = request.form.get("From")
+    user = request.form.get("From")  # WhatsApp nummer wordt user_id
 
     reply = ""
 
@@ -236,7 +222,7 @@ def whatsapp():
     resp.message(reply)
     return str(resp)
 
-# ---------------- ETORO CSV ENDPOINT ----------------
+# ---------------- ETORO CSV UPLOAD ----------------
 @app.route("/import-etoro", methods=["POST"])
 def import_etoro():
     if "file" not in request.files:
@@ -247,8 +233,11 @@ def import_etoro():
         return "Geen bestand geselecteerd", 400
 
     try:
-        # Gebruik WhatsApp nummer als user_id indien beschikbaar
-        user_id = request.form.get("from_whatsapp", "user_etoro")
+        # Koppel CSV automatisch aan WhatsApp user_id
+        user_id = request.form.get("from_whatsapp")
+        if not user_id:
+            return "user_id ontbreekt. Geef exact WhatsApp From nummer.", 400
+
         import_etoro_csv(user_id, file)
         return f"Portfolio succesvol bijgewerkt voor {user_id}!", 200
     except Exception as e:
@@ -269,5 +258,5 @@ def start_auto_import():
 
 # ---------------- START ----------------
 if __name__ == "__main__":
-    start_auto_import()  # start dagelijkse CSV-import in background
+    start_auto_import()
     app.run()
