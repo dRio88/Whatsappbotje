@@ -5,5 +5,4 @@ gunicorn
 yfinance
 pandas
 numpy
-redis
 psycopg2-binary
