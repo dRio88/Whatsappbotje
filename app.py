@@ -93,6 +93,21 @@ Trend: {market['trend']}
 
     return response.choices[0].message.content
 
+# ---------------- ETORO CSV INTEGRATIE ----------------
+def import_etoro_csv(user_id, csv_path):
+    """Leest Etoro CSV en update portfolio in Postgres"""
+    df = pd.read_csv(csv_path)
+    required_cols = ['Ticker', 'Shares']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"CSV mist vereiste kolommen: {required_cols}")
+
+    for _, row in df.iterrows():
+        ticker = row['Ticker'].strip().upper()
+        shares = float(row['Shares'])
+        # Gebruik bestaande add_to_portfolio functie
+        add_to_portfolio(user_id, ticker, shares)
+    print(f"Portfolio succesvol bijgewerkt voor {user_id}!")
+
 # ---------------- PORTFOLIO ----------------
 def add_to_portfolio(user, ticker, shares):
     with db.cursor() as c:
