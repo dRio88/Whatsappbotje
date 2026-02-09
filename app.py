@@ -89,17 +89,15 @@ def send_long_message(resp, text):
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    user = request.form.get("From")  # WhatsApp nummer = user_id
     msg = request.form.get("Body").strip()
+    user = request.form.get("From")  # WhatsApp nummer wordt user_id
+
     reply = ""
 
     if msg.lower().startswith("koop"):
-        try:
-            _, ticker, shares = msg.split()
-            add_to_portfolio(user, ticker.upper(), float(shares))
-            reply = f"✅ Toegevoegd: {shares} aandelen {ticker.upper()}"
-        except:
-            reply = "⚠️ Gebruik: koop <TICKER> <AANTAL>"
+        _, ticker, shares = msg.split()
+        add_to_portfolio(user, ticker.upper(), float(shares))
+        reply = f"✅ Toegevoegd: {shares} aandelen {ticker.upper()}"
 
     elif msg.lower().startswith("portfolio"):
         pf = get_portfolio(user)
@@ -108,23 +106,27 @@ def whatsapp():
         else:
             reply = "📂 Je portfolio:\n"
             for t, s in pf:
-                reply += f"💹 {t}: {s} aandelen\n"
+                reply += f"- {t}: {s} aandelen\n"
 
-    elif msg.lower().startswith("brief"):
-        tickers = ["AAPL","MSFT","SPY","BTC-USD"]
-        reply = "📊 Dagelijkse Marktupdate\n\n"
-        for t in tickers:
-            d = get_technical_data(t)
-            if d:
-                trend_emoji = "📈" if d["trend"]=="bullish" else "📉"
-                reply += f"{trend_emoji} {t}: ${d['price']} | RSI {d['rsi']} | {d['trend']}\n"
+    elif "waarschuw" in msg.lower():
+        parts = msg.split()
+        ticker = parts[-2].upper()
+        rsi = float(parts[-1])
+        add_alert(user, ticker, rsi)
+        reply = f"⏰ Alert ingesteld: {ticker} bij RSI < {rsi}"
+
+    elif msg.lower() == "brief":
+        reply = daily_brief()
 
     else:
-        reply = "🤖 Gebruik 'koop <ticker> <aantal>', 'portfolio' of 'brief'"
+        ticker = msg.split()[-1].upper()
+        market = get_technical_data(ticker)
+        reply = ask_gpt(user, msg, market)
 
     add_history(user, msg, reply)
+
     resp = MessagingResponse()
-    send_long_message(resp, reply)
+    resp.message(reply)
     return str(resp)
 
 # ---------------- CSV UPLOAD ----------------
