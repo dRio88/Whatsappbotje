@@ -3,4 +3,7 @@ twilio
 openai>=1.0.0
 gunicorn
 yfinance
-tinydb
+pandas
+numpy
+redis
+psycopg2-binary
