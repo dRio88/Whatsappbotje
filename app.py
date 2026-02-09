@@ -43,6 +43,22 @@ def init_db():
 
 init_db()
 
+def import_etoro_csv(user_id, file):
+    """Leest Etoro CSV en update portfolio in Postgres"""
+    import pandas as pd
+
+    df = pd.read_csv(file)
+    required_cols = ['Ticker', 'Shares']
+    if not all(col.strip() in df.columns for col in required_cols):
+        raise ValueError(f"CSV mist vereiste kolommen: {required_cols}")
+
+    for _, row in df.iterrows():
+        ticker = str(row['Ticker']).strip().upper()
+        shares = float(row['Shares'])
+        add_to_portfolio(user_id, ticker, shares)
+
+    print(f"Portfolio succesvol bijgewerkt voor {user_id}!")
+
 # ---------------- MARKET DATA ----------------
 def get_technical_data(ticker):
     df = yf.Ticker(ticker).history(period="3mo")
@@ -110,19 +126,14 @@ def import_etoro_csv(user_id, csv_path):
 
 # ---------------- PORTFOLIO ----------------
 def add_to_portfolio(user, ticker, shares):
+    """Voegt aandelen toe of update bestaande hoeveelheid"""
     with db.cursor() as c:
-        c.execute(
-            "INSERT INTO portfolios VALUES (%s,%s,%s)",
-            (user, ticker, shares)
-        )
-
-def get_portfolio(user):
-    with db.cursor() as c:
-        c.execute(
-            "SELECT ticker, shares FROM portfolios WHERE user_id=%s",
-            (user,)
-        )
-        return c.fetchall()
+        c.execute("""
+            INSERT INTO portfolios (user_id, ticker, shares)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, ticker)
+            DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
+        """, (user, ticker, shares))
 
 # ---------------- ALERTS ----------------
 def add_alert(user, ticker, rsi):
@@ -217,6 +228,23 @@ def whatsapp():
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
+
+@app.route("/import-etoro", methods=["POST"])
+def import_etoro():
+    if "file" not in request.files:
+        return "Geen CSV bestand meegegeven", 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return "Geen bestand geselecteerd", 400
+
+    try:
+        # Gebruik user_id uit formulier, of fallback naar 'user_etoro'
+        user_id = request.form.get("user_id", "user_etoro")
+        import_etoro_csv(user_id, file)
+        return f"Portfolio succesvol bijgewerkt voor {user_id}!", 200
+    except Exception as e:
+        return f"Fout bij import: {e}", 500
 
 # ---------------- ALERT CRON ENDPOINT ----------------
 @app.route("/check-alerts")
