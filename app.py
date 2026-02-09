@@ -3,7 +3,6 @@ from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import psycopg2
 import os
 import json
@@ -22,7 +21,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS portfolios (
             user_id TEXT,
             ticker TEXT,
-            shares FLOAT
+            shares FLOAT,
+            PRIMARY KEY(user_id, ticker)
         );
         """)
         c.execute("""
@@ -43,10 +43,28 @@ def init_db():
 
 init_db()
 
+# ---------------- PORTFOLIO ----------------
+def add_to_portfolio(user, ticker, shares):
+    """Voegt aandelen toe of update bestaande hoeveelheid"""
+    with db.cursor() as c:
+        c.execute("""
+            INSERT INTO portfolios (user_id, ticker, shares)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, ticker)
+            DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
+        """, (user, ticker, shares))
+
+def get_portfolio(user):
+    with db.cursor() as c:
+        c.execute(
+            "SELECT ticker, shares FROM portfolios WHERE user_id=%s",
+            (user,)
+        )
+        return c.fetchall()
+
+# ---------------- ETORO CSV INTEGRATIE ----------------
 def import_etoro_csv(user_id, file):
     """Leest Etoro CSV en update portfolio in Postgres"""
-    import pandas as pd
-
     df = pd.read_csv(file)
     required_cols = ['Ticker', 'Shares']
     if not all(col.strip() in df.columns for col in required_cols):
@@ -109,32 +127,6 @@ Trend: {market['trend']}
 
     return response.choices[0].message.content
 
-# ---------------- ETORO CSV INTEGRATIE ----------------
-def import_etoro_csv(user_id, csv_path):
-    """Leest Etoro CSV en update portfolio in Postgres"""
-    df = pd.read_csv(csv_path)
-    required_cols = ['Ticker', 'Shares']
-    if not all(col in df.columns for col in required_cols):
-        raise ValueError(f"CSV mist vereiste kolommen: {required_cols}")
-
-    for _, row in df.iterrows():
-        ticker = row['Ticker'].strip().upper()
-        shares = float(row['Shares'])
-        # Gebruik bestaande add_to_portfolio functie
-        add_to_portfolio(user_id, ticker, shares)
-    print(f"Portfolio succesvol bijgewerkt voor {user_id}!")
-
-# ---------------- PORTFOLIO ----------------
-def add_to_portfolio(user, ticker, shares):
-    """Voegt aandelen toe of update bestaande hoeveelheid"""
-    with db.cursor() as c:
-        c.execute("""
-            INSERT INTO portfolios (user_id, ticker, shares)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, ticker)
-            DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
-        """, (user, ticker, shares))
-
 # ---------------- ALERTS ----------------
 def add_alert(user, ticker, rsi):
     with db.cursor() as c:
@@ -191,7 +183,6 @@ def whatsapp():
 
     # ---- COMMANDS ----
     if msg.lower().startswith("koop"):
-        # koop AAPL 5
         _, ticker, shares = msg.split()
         add_to_portfolio(user, ticker.upper(), float(shares))
         reply = f"✅ Toegevoegd: {shares} aandelen {ticker.upper()}"
@@ -206,7 +197,6 @@ def whatsapp():
                 reply += f"- {t}: {s} aandelen\n"
 
     elif "waarschuw" in msg.lower():
-        # waarschuw AAPL 30
         parts = msg.split()
         ticker = parts[-2].upper()
         rsi = float(parts[-1])
@@ -217,18 +207,17 @@ def whatsapp():
         reply = daily_brief()
 
     else:
-        # normale chat / analyse
         ticker = msg.split()[-1].upper()
         market = get_technical_data(ticker)
         reply = ask_gpt(user, msg, market)
 
-    # Opslaan in Postgres in plaats van Redis
     add_history(user, msg, reply)
 
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
+# ---------------- ETORO CSV ENDPOINT ----------------
 @app.route("/import-etoro", methods=["POST"])
 def import_etoro():
     if "file" not in request.files:
