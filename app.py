@@ -1,31 +1,28 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import psycopg2
 import os
+import requests
 from datetime import datetime
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ---------------- CONFIG ----------------
 app = Flask(__name__)
+MAX_LEN = 1500  # WhatsApp veilige limiet per bericht
 
-MAX_LEN = 1500  # veilige WhatsApp limiet
+# OpenAI setup
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-openai_api_key = os.environ.get("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY ontbreekt.")
-client = OpenAI(api_key=openai_api_key)
-
-database_url = os.environ.get("DATABASE_URL")
-if not database_url:
-    raise ValueError("DATABASE_URL ontbreekt.")
-db = psycopg2.connect(database_url)
+# Postgres setup
+db = psycopg2.connect(os.environ["DATABASE_URL"])
 db.autocommit = True
+
+# Base44 setup
+BASE44_APP_ID = "698c993f605f6ce2ca5c8c85"
+BASE44_API_KEY = "26f6dced974a4b6f9e808116aa25e243"
+BASE44_BASE_URL = "https://app.base44.com/api"
 
 # ---------------- DATABASE ----------------
 def init_db():
@@ -36,108 +33,47 @@ def init_db():
             ticker TEXT,
             shares FLOAT,
             PRIMARY KEY(user_id, ticker)
-        );
-        """)
+        );""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             user_id TEXT,
             ticker TEXT,
             rsi_threshold FLOAT,
             PRIMARY KEY(user_id, ticker)
-        );
-        """)
+        );""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS history (
             user_id TEXT,
             user_msg TEXT,
             bot_msg TEXT,
             created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
-
+        );""")
 init_db()
 
-# ---------------- HELPER ----------------
-def send_long_message(resp, text):
-    for i in range(0, len(text), MAX_LEN):
-        resp.message(text[i:i+MAX_LEN])
+# ---------------- BASE44 PORTFOLIO ----------------
+def fetch_base44_portfolio(user_id):
+    """Haalt portfolio op van Base44 API"""
+    url = f"{BASE44_BASE_URL}/apps/{BASE44_APP_ID}/entities/Portfolio"
+    headers = {
+        "api_key": BASE44_API_KEY,
+        "Content-Type": "application/json"
+    }
+    params = {"filter[user_id]": user_id}  # filter op user_id
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    return response.json()["data"]
 
-# ---------------- MARKET DATA ----------------
-def get_technical_data(ticker):
+def sync_portfolio(user_id):
+    """Sync Base44 portfolio naar lokale Postgres"""
     try:
-        df = yf.Ticker(ticker).history(period="3mo")
-        if df.empty or len(df) < 20:
-            return None
-
-        close = df["Close"]
-
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-
-        avg_gain = gain.ewm(com=13, adjust=False).mean()
-        avg_loss = loss.ewm(com=13, adjust=False).mean()
-
-        rs = np.where(avg_loss == 0, np.inf, avg_gain / avg_loss)
-        rsi = 100 - (100 / (1 + rs))
-
-        sma50 = close.rolling(50).mean()
-
-        trend = "bullish" if close.iloc[-1] > sma50.iloc[-1] else "bearish"
-
-        return {
-            "price": round(close.iloc[-1], 2),
-            "rsi": round(rsi[-1], 1),
-            "trend": trend
-        }
-    except:
-        return None
-
-# ---------------- OPENAI ----------------
-def ask_gpt(user_id, message, market_data=None):
-
-    system_prompt = """
-Je bent een professionele beleggingsassistent.
-
-BELANGRIJK:
-- Je krijgt actuele realtime marktdata aangeleverd.
-- Deze data is actueel en mag als live beschouwd worden.
-- Zeg NOOIT dat je geen toegang hebt tot live data.
-- Verwijs NOOIT naar een kennis-cutoff datum.
-
-Gebruik uitsluitend de aangeleverde marktdata indien beschikbaar.
-Je geeft GEEN financieel advies.
-Leg duidelijk, praktisch en begrijpelijk uit.
-"""
-
-    messages = [{"role": "system", "content": system_prompt}]
-
-    history = get_history(user_id, 5)
-    for u, b in history:
-        messages.append({"role": "user", "content": u})
-        messages.append({"role": "assistant", "content": b})
-
-    if market_data:
-        market_context = f"""
-Realtime marktdata:
-Prijs: ${market_data['price']}
-RSI: {market_data['rsi']}
-Trend: {market_data['trend']}
-"""
-        messages.append({"role": "system", "content": market_context})
-
-    messages.append({"role": "user", "content": message})
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.6,
-            max_tokens=350
-        )
-        return response.choices[0].message.content
-    except:
-        return "⚠️ Er ging iets mis bij het analyseren van de markt."
+        items = fetch_base44_portfolio(user_id)
+        for item in items:
+            ticker = item["attributes"]["ticker"].upper()
+            shares = float(item["attributes"]["shares"])
+            add_to_portfolio(user_id, ticker, shares)
+        print(f"[SYNC] Portfolio bijgewerkt voor {user_id}")
+    except Exception as e:
+        print(f"[SYNC ERROR] {e}")
 
 # ---------------- PORTFOLIO ----------------
 def add_to_portfolio(user_id, ticker, shares):
@@ -154,70 +90,31 @@ def get_portfolio(user_id):
         c.execute("SELECT ticker, shares FROM portfolios WHERE user_id=%s", (user_id,))
         return c.fetchall()
 
-# ---------------- ALERTS ----------------
-def add_alert(user_id, ticker, rsi_threshold):
-    with db.cursor() as c:
-        c.execute("""
-            INSERT INTO alerts(user_id, ticker, rsi_threshold)
-            VALUES(%s,%s,%s)
-            ON CONFLICT(user_id, ticker)
-            DO UPDATE SET rsi_threshold = EXCLUDED.rsi_threshold;
-        """, (user_id, ticker, rsi_threshold))
-
-def get_alerts():
-    with db.cursor() as c:
-        c.execute("SELECT user_id, ticker, rsi_threshold FROM alerts")
-        return c.fetchall()
-
-# ---------------- CHAT HISTORY ----------------
-def add_history(user_id, user_msg, bot_msg):
-    with db.cursor() as c:
-        c.execute(
-            "INSERT INTO history (user_id, user_msg, bot_msg, created_at) VALUES (%s,%s,%s,%s)",
-            (user_id, user_msg, bot_msg, datetime.now())
-        )
-
-def get_history(user_id, limit):
-    with db.cursor() as c:
-        c.execute("""
-            SELECT user_msg, bot_msg 
-            FROM history 
-            WHERE user_id=%s 
-            ORDER BY created_at DESC 
-            LIMIT %s
-        """, (user_id, limit))
-        return c.fetchall()[::-1]
-
-# ---------------- DAILY BRIEF ----------------
-def daily_brief():
-    tickers = ["AAPL","MSFT","NVDA","TSLA","SPY","BTC-USD"]
-    lines = ["📊 *Dagelijkse Marktupdate*\n"]
-
-    for t in tickers:
-        d = get_technical_data(t)
-        if d:
-            emoji = "📈" if d["trend"] == "bullish" else "📉"
-            lines.append(
-                f"{emoji} *{t}*\n"
-                f"Prijs: ${d['price']}\n"
-                f"RSI: {d['rsi']}\n"
-                f"Trend: {d['trend']}\n"
-            )
-
-    lines.append("⚠️ Dit is geen financieel advies.")
-    return "\n".join(lines)
+# ---------------- HELPER ----------------
+def send_long_message(resp, text):
+    for i in range(0, len(text), MAX_LEN):
+        resp.message(text[i:i+MAX_LEN])
 
 # ---------------- WHATSAPP ----------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-
     user = request.form.get("From")
     msg = request.form.get("Body").strip()
-    reply = None
-
     lower = msg.lower()
+    reply = ""
 
-    if lower.startswith("koop"):
+    # Commando's
+    if lower == "portfolio":
+        sync_portfolio(user)  # haal eerst Base44 portfolio op
+        pf = get_portfolio(user)
+        if not pf:
+            reply = "📂 Je portfolio is leeg."
+        else:
+            reply = "📂 *Jouw Portfolio*\n"
+            for t, s in pf:
+                reply += f"💹 {t}: {s} aandelen\n"
+
+    elif lower.startswith("koop"):
         try:
             _, ticker, shares = msg.split()
             add_to_portfolio(user, ticker.upper(), float(shares))
@@ -225,31 +122,85 @@ def whatsapp():
         except:
             reply = "Gebruik: koop <TICKER> <AANTAL>"
 
-    elif lower == "portfolio":
-        pf = get_portfolio(user)
-        if not pf:
-            reply = "📂 Je portfolio is leeg."
-        else:
-            text = "📂 *Jouw Portfolio*\n\n"
-            for t, s in pf:
-                text += f"💹 *{t}*\nAantal: {s}\n\n"
-            reply = text
-
     elif lower == "brief":
         reply = daily_brief()
 
     else:
+        # GPT-analyse
         words = [w.upper() for w in msg.split() if w.isalpha()]
         market_data = None
         if words:
             market_data = get_technical_data(words[-1])
         reply = ask_gpt(user, msg, market_data)
 
+    # Opslaan in Postgres
     add_history(user, msg, reply)
 
     resp = MessagingResponse()
     send_long_message(resp, reply)
     return str(resp)
+
+# ---------------- MARKET DATA ----------------
+def get_technical_data(ticker):
+    try:
+        import yfinance as yf
+        df = yf.Ticker(ticker).history(period="3mo")
+        if df.empty or len(df) < 20: return None
+        close = df["Close"]
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=13, adjust=False).mean()
+        avg_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = np.where(avg_loss==0, np.inf, avg_gain/avg_loss)
+        rsi = 100 - (100 / (1+rs))
+        sma50 = close.rolling(50).mean()
+        trend = "📈 bullish" if close.iloc[-1] > sma50.iloc[-1] else "📉 bearish"
+        return {"price": round(close.iloc[-1],2), "rsi": round(rsi[-1],1), "trend": trend}
+    except:
+        return None
+
+# ---------------- OPENAI ----------------
+def ask_gpt(user_id, message, market_data=None):
+    system_prompt = """
+Je bent een professionele beleggingsassistent.
+BELANGRIJK:
+- Gebruik uitsluitend de aangeleverde marktdata.
+- Geef GEEN financieel advies.
+"""
+    messages = [{"role":"system","content":system_prompt}]
+    for u,b in get_history(user_id,5):
+        messages.append({"role":"user","content":u})
+        messages.append({"role":"assistant","content":b})
+    if market_data:
+        messages.append({"role":"system","content":f"Marktdata:\nPrijs: ${market_data['price']}\nRSI: {market_data['rsi']}\nTrend: {market_data['trend']}"})
+    messages.append({"role":"user","content":message})
+    try:
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.6, max_tokens=350)
+        return resp.choices[0].message.content
+    except:
+        return "⚠️ AI kon je vraag niet verwerken."
+
+# ---------------- DAILY BRIEF ----------------
+def daily_brief():
+    tickers = ["AAPL","MSFT","NVDA","TSLA","SPY","BTC-USD"]
+    lines = ["📊 *Dagelijkse Marktupdate*\n"]
+    for t in tickers:
+        d = get_technical_data(t)
+        if d:
+            lines.append(f"{d['trend']} *{t}*\nPrijs: ${d['price']}\nRSI: {d['rsi']}\n")
+    lines.append("⚠️ Dit is geen financieel advies.")
+    return "\n".join(lines)
+
+# ---------------- CHAT HISTORY ----------------
+def add_history(user_id, u_msg, b_msg):
+    with db.cursor() as c:
+        c.execute("INSERT INTO history(user_id,user_msg,bot_msg,created_at) VALUES(%s,%s,%s,%s)", (user_id,u_msg,b_msg,datetime.now()))
+
+def get_history(user_id, limit):
+    with db.cursor() as c:
+        c.execute("SELECT user_msg,bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",(user_id,limit))
+        return c.fetchall()[::-1]
 
 # ---------------- START ----------------
 if __name__ == "__main__":
