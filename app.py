@@ -53,27 +53,43 @@ init_db()
 # ---------------- BASE44 PORTFOLIO ----------------
 def fetch_base44_portfolio(user_id):
     """Haalt portfolio op van Base44 API"""
-    url = f"{BASE44_BASE_URL}/apps/{BASE44_APP_ID}/entities/Portfolio"
+    url = f"{BASE44_BASE_URL}/apps/{BASE44_APP_ID}/functions/getPortfolio"
     headers = {
         "api_key": BASE44_API_KEY,
         "Content-Type": "application/json"
     }
-    params = {"filter[user_id]": user_id}  # filter op user_id
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()["data"]
+    data = {"param1": user_id}  # Base44 verwacht parameter user_id
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        return response.json().get("positions", [])
+    except Exception as e:
+        print(f"[BASE44 FETCH ERROR] {e}")
+        return []
 
 def sync_portfolio(user_id):
     """Sync Base44 portfolio naar lokale Postgres"""
-    try:
-        items = fetch_base44_portfolio(user_id)
-        for item in items:
-            ticker = item["attributes"]["ticker"].upper()
-            shares = float(item["attributes"]["shares"])
+    items = fetch_base44_portfolio(user_id)
+    for item in items:
+        ticker = item.get("ticker", "").upper()
+        shares = float(item.get("shares", 0))
+        if ticker and shares > 0:
             add_to_portfolio(user_id, ticker, shares)
-        print(f"[SYNC] Portfolio bijgewerkt voor {user_id}")
+
+def update_base44_portfolio(user_id, ticker, shares):
+    """Stuur portfolio update naar Base44"""
+    url = f"{BASE44_BASE_URL}/apps/{BASE44_APP_ID}/functions/updatePortfolio"
+    headers = {
+        "api_key": BASE44_API_KEY,
+        "Content-Type": "application/json"
+    }
+    data = {"user_id": user_id, "ticker": ticker, "shares": shares}
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        print(f"[BASE44 SYNC] {ticker} {shares} aandelen bijgewerkt voor {user_id}")
     except Exception as e:
-        print(f"[SYNC ERROR] {e}")
+        print(f"[BASE44 UPDATE ERROR] {e}")
 
 # ---------------- PORTFOLIO ----------------
 def add_to_portfolio(user_id, ticker, shares):
@@ -84,6 +100,7 @@ def add_to_portfolio(user_id, ticker, shares):
             ON CONFLICT(user_id, ticker)
             DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
         """, (user_id, ticker, shares))
+    update_base44_portfolio(user_id, ticker, shares)  # sync direct
 
 def get_portfolio(user_id):
     with db.cursor() as c:
@@ -103,7 +120,6 @@ def whatsapp():
     lower = msg.lower()
     reply = ""
 
-    # Commando's
     if lower == "portfolio":
         sync_portfolio(user)  # haal eerst Base44 portfolio op
         pf = get_portfolio(user)
@@ -117,7 +133,8 @@ def whatsapp():
     elif lower.startswith("koop"):
         try:
             _, ticker, shares = msg.split()
-            add_to_portfolio(user, ticker.upper(), float(shares))
+            shares = float(shares)
+            add_to_portfolio(user, ticker.upper(), shares)
             reply = f"✅ {shares} aandelen {ticker.upper()} toegevoegd."
         except:
             reply = "Gebruik: koop <TICKER> <AANTAL>"
@@ -126,16 +143,13 @@ def whatsapp():
         reply = daily_brief()
 
     else:
-        # GPT-analyse
         words = [w.upper() for w in msg.split() if w.isalpha()]
         market_data = None
         if words:
             market_data = get_technical_data(words[-1])
         reply = ask_gpt(user, msg, market_data)
 
-    # Opslaan in Postgres
     add_history(user, msg, reply)
-
     resp = MessagingResponse()
     send_long_message(resp, reply)
     return str(resp)
