@@ -12,10 +12,11 @@ from twilio.twiml.messaging_response import MessagingResponse
 # ---------------- CONFIG ----------------
 
 app = Flask(__name__)
-MAX_MESSAGE_CHARS = 1500
+MAX_MESSAGE_CHARS = 900
 DEFAULT_HISTORY_LIMIT = 8
 BRIEF_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "BTC-USD"]
 COMMANDS = {"KOOP", "PORTFOLIO", "BRIEF", "HELP"}
+MAX_AI_REPLY_CHARS = 780
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -84,6 +85,13 @@ def chunk_message(text: str, max_len: int = MAX_MESSAGE_CHARS):
 def send_long_message(resp, text):
     for chunk in chunk_message(text):
         resp.message(chunk)
+
+
+def shorten_reply(text: str, limit: int = MAX_AI_REPLY_CHARS):
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
 
 
 def add_history(user_id, user_msg, bot_msg):
@@ -206,11 +214,11 @@ def get_technical_data(ticker):
 
 def build_system_prompt():
     return (
-        "You are an investment analysis assistant focused on portfolio insight and risk awareness. "
+        "You are a witty but responsible investment analysis assistant focused on portfolio insight and risk awareness. "
         "You may explain trends, volatility, RSI/SMA interpretation, diversification, and scenario analysis. "
         "Never provide guaranteed returns or direct buy/sell orders. "
         "Always add a brief disclaimer that this is educational information, not financial advice. "
-        "Be concise and answer in the user's language."
+        "Answer in the user's language, keep it practical, lightly funny, and under 750 characters."
     )
 
 
@@ -313,11 +321,15 @@ def ask_gpt(user_id, message, market_data=None):
 
 def format_portfolio(rows):
     if not rows:
-        return "📂 Je portfolio is leeg."
+        return "📂 Je portfolio is leeg. Tijd om je watchlist spieren te trainen 💪📈"
 
     lines = ["📂 *Jouw Portfolio*"]
     for ticker, shares in rows:
-        lines.append(f"💹 {ticker}: {shares} aandelen")
+        if shares.is_integer():
+            shares_text = str(int(shares))
+        else:
+            shares_text = f"{shares:.4f}".rstrip("0").rstrip(".")
+        lines.append(f"💹 {ticker}: {shares_text} aandelen")
     lines.append("\n⚠️ Dit is geen financieel advies.")
     return "\n".join(lines)
 
@@ -343,12 +355,13 @@ def daily_brief():
 
 def help_text():
     return (
-        "Beschikbare commando's:\n"
+        "📚 *Beschikbare commando's*\n"
         "• portfolio\n"
         "• koop <TICKER> <AANTAL>\n"
         "• brief\n"
         "• help\n\n"
-        "Voor vrije vragen kun je bv sturen: 'Wat vind je van NVDA trend?'"
+        "Voor vrije vragen kun je bv sturen: 'Wat vind je van NVDA trend?'\n"
+        "Ik bijt niet, behalve in slechte risk/reward setups 😄"
     )
 
 
@@ -374,7 +387,7 @@ def whatsapp():
         if msg_lower == "portfolio":
             reply = format_portfolio(get_portfolio(user))
 
-        elif msg_lower.startswith("koop"):
+        elif msg_lower == "koop" or msg_lower.startswith("koop "):
             try:
                 ticker, shares = parse_buy_command(msg)
                 add_to_portfolio(user, ticker, shares)
@@ -391,7 +404,7 @@ def whatsapp():
         else:
             ticker = detect_ticker_from_text(msg)
             market_data = get_technical_data(ticker) if ticker else None
-            reply = ask_gpt(user, msg, market_data)
+            reply = shorten_reply(ask_gpt(user, msg, market_data))
 
     except Exception as exc:
         print(f"[App Error] {exc}")
