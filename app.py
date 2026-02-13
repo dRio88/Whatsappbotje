@@ -16,10 +16,11 @@ MAX_MESSAGE_CHARS = 900
 DEFAULT_HISTORY_LIMIT = 8
 BRIEF_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "BTC-USD"]
 COMMANDS = {"KOOP", "PORTFOLIO", "BRIEF", "HELP"}
-MAX_AI_REPLY_CHARS = 780
+MAX_AI_REPLY_CHARS = 1500  # verhoogd voor langere analyses
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_FALLBACK_MODELS = [
     model.strip()
@@ -219,6 +220,7 @@ def ask_gpt(user_id, message, market_data=None):
             history_lines.append(f"Assistant: {bot_text}")
     except Exception as exc:
         print(f"[History Read Error] {exc}")
+
     prompt_text = build_user_prompt(message, market_data)
     conversation_text = "\n".join(history_lines + [f"User: {prompt_text}"])
     models_to_try = [OPENAI_MODEL] + [m for m in OPENAI_FALLBACK_MODELS if m != OPENAI_MODEL]
@@ -228,7 +230,7 @@ def ask_gpt(user_id, message, market_data=None):
             response = client.responses.create(
                 model=model_name,
                 temperature=0.3,
-                max_output_tokens=420,
+                max_output_tokens=600,
                 input=[
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                     {"role": "user", "content": [{"type": "input_text", "text": conversation_text}]},
@@ -238,41 +240,11 @@ def ask_gpt(user_id, message, market_data=None):
                 return response.output_text
         except Exception as exc:
             print(f"[Responses API Error][{model_name}] {exc}")
-        messages = [{"role": "system", "content": system_prompt}]
-        try:
-            for user_text, bot_text in get_history(user_id):
-                messages.append({"role": "user", "content": user_text})
-                messages.append({"role": "assistant", "content": bot_text})
-        except Exception as exc:
-            print(f"[History Read Error Fallback] {exc}")
-        messages.append({"role": "user", "content": prompt_text})
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=0.3,
-                max_completion_tokens=420,
-            )
-            content = response.choices[0].message.content
-            if content:
-                return content
-        except TypeError:
-            try:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=420,
-                )
-                content = response.choices[0].message.content
-                if content:
-                    return content
-            except Exception as exc:
-                print(f"[Chat Fallback Error][{model_name}] {exc}")
-        except Exception as exc:
-            print(f"[Chat Error][{model_name}] {exc}")
 
-    return "⚠️ AI kon je vraag niet verwerken."
+    return (
+        "⚠️ AI kon je vraag niet verwerken. "
+        "Controleer OPENAI_MODEL/OPENAI_FALLBACK_MODELS of je API-toegang."
+    )
 
 # ---------------- RESPONSE BUILDERS ----------------
 
@@ -308,50 +280,10 @@ def help_text():
         "• portfolio\n"
         "• koop <TICKER> <AANTAL>\n"
         "• brief\n"
-        "• help\n"
-        "• etoro <cash>\n\n"
+        "• help\n\n"
         "Voor vrije vragen kun je bv sturen: 'Wat vind je van NVDA trend?'\n"
         "Ik bijt niet, behalve in slechte risk/reward setups 😄"
     )
-
-# ---------------- PORTFOLIO ANALYSIS & ETORO ----------------
-
-def portfolio_analysis(user_id):
-    """
-    Analyseer sector, risico en exposure voor huidige portfolio.
-    (Placeholder: kan later echte sector/risk koppelen)
-    """
-    rows = get_portfolio(user_id)
-    if not rows:
-        return "📊 Je portfolio is leeg. Geen analyse beschikbaar."
-
-    lines = ["📊 *Portfolio Analyse*"]
-    total_shares = sum(shares for _, shares in rows)
-    for ticker, shares in rows:
-        pct = (shares / total_shares) * 100 if total_shares > 0 else 0
-        lines.append(f"• {ticker}: {pct:.1f}% van portfolio")
-    lines.append("\n⚠️ Educatieve info, geen financieel advies.")
-    return "\n".join(lines)
-
-def etoro_plan(user_id, available_cash):
-    """
-    Geeft prioriteit en limietadvies voor aankopen op basis van cash en huidige prijzen
-    """
-    rows = get_portfolio(user_id)
-    if not rows:
-        return "📊 Je portfolio is leeg. Geen Etoro planning mogelijk."
-
-    plan_lines = ["📈 Etoro Koopadvies (educatief)"]
-    for ticker, shares in rows:
-        data = get_technical_data(ticker)
-        if not data:
-            continue
-        price = data["price"]
-        max_affordable = int(available_cash // price) if price > 0 else 0
-        plan_lines.append(f"• {ticker}: huidige prijs ${price} — max aankopen met cash: {max_affordable} aandelen")
-
-    plan_lines.append("⚠️ Dit is een simulatie. Controleer je broker voor exacte orders.")
-    return "\n".join(plan_lines)
 
 # ---------------- ROUTES ----------------
 
@@ -372,6 +304,7 @@ def whatsapp():
     try:
         if msg_lower == "portfolio":
             reply = format_portfolio(get_portfolio(user))
+
         elif msg_lower.startswith("koop"):
             try:
                 ticker, shares = parse_buy_command(msg)
@@ -379,23 +312,19 @@ def whatsapp():
                 reply = f"✅ {shares} aandelen {ticker} toegevoegd."
             except ValueError as exc:
                 reply = f"⚠️ {exc}"
+
         elif msg_lower == "brief":
             reply = daily_brief()
+
         elif msg_lower == "help":
             reply = help_text()
-        elif msg_lower.startswith("etoro"):
-            try:
-                parts = msg_lower.split()
-                if len(parts) != 2:
-                    raise ValueError("Gebruik: etoro <beschikbare_cash>")
-                available_cash = float(parts[1].replace(",", "."))
-                reply = etoro_plan(user, available_cash)
-            except ValueError as exc:
-                reply = f"⚠️ {exc}"
+
         else:
             ticker = detect_ticker_from_text(msg)
             market_data = get_technical_data(ticker) if ticker else None
-            reply = shorten_reply(ask_gpt(user, msg, market_data))
+            ai_reply = ask_gpt(user, msg, market_data)
+            reply = shorten_reply(ai_reply, limit=MAX_AI_REPLY_CHARS)
+
     except Exception as exc:
         print(f"[App Error] {exc}")
         reply = "⚠️ Er ging iets mis. Probeer later opnieuw."
@@ -408,6 +337,8 @@ def whatsapp():
     twiml = MessagingResponse()
     send_long_message(twiml, reply)
     return str(twiml)
+
+# ---------------- MAIN ----------------
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
