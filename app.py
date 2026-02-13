@@ -1,6 +1,6 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from openai import OpenAI
+from anthropic import Anthropic
 import requests
 import pandas as pd
 import numpy as np
@@ -12,8 +12,8 @@ from datetime import datetime
 app = Flask(__name__)
 MAX_LEN = 1500  # WhatsApp veilige limiet per bericht
 
-# OpenAI setup
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# Anthropic Claude setup
+client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 # Postgres setup
 db = psycopg2.connect(os.environ["DATABASE_URL"])
@@ -114,26 +114,40 @@ def get_technical_data(ticker):
     except:
         return None
 
-# ---------------- OPENAI ----------------
-def ask_gpt(user_id, message, market_data=None):
-    system_prompt = """
-Je bent een professionele beleggingsassistent.
-BELANGRIJK:
-- Gebruik uitsluitend de aangeleverde marktdata.
-- Geef GEEN financieel advies.
-"""
-    messages = [{"role":"system","content":system_prompt}]
-    for u,b in get_history(user_id,5):
-        messages.append({"role":"user","content":u})
-        messages.append({"role":"assistant","content":b})
+# ---------------- CLAUDE HAIKU ----------------
+def ask_claude(user_id, message, market_data=None):
+    system_prompt = """You are a professional investment assistant.
+IMPORTANT:
+- Use only the provided market data.
+- Do NOT provide financial advice.
+- Keep responses concise and helpful.
+- Respond in the user's language if possible."""
+    
+    messages = []
+    
+    # Add conversation history
+    for u, b in get_history(user_id, 5):
+        messages.append({"role": "user", "content": u})
+        messages.append({"role": "assistant", "content": b})
+    
+    # Add market data context if available
+    user_message = message
     if market_data:
-        messages.append({"role":"system","content":f"Marktdata:\nPrijs: ${market_data['price']}\nRSI: {market_data['rsi']}\nTrend: {market_data['trend']}"})
-    messages.append({"role":"user","content":message})
+        user_message += f"\n\n[Market Data]\nPrice: ${market_data['price']}\nRSI: {market_data['rsi']}\nTrend: {market_data['trend']}"
+    
+    messages.append({"role": "user", "content": user_message})
+    
     try:
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.6, max_tokens=350)
-        return resp.choices[0].message.content
-    except:
-        return "⚠️ AI kon je vraag niet verwerken."
+        response = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=350,
+            system=system_prompt,
+            messages=messages
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"[Claude ERROR] {e}")
+        return "⚠️ AI could not process your request."
 
 # ---------------- DAILY BRIEF ----------------
 def daily_brief():
@@ -187,7 +201,7 @@ def whatsapp():
     else:
         words = [w.upper() for w in msg.split() if w.isalpha()]
         market_data = get_technical_data(words[-1]) if words else None
-        reply = ask_gpt(user, msg, market_data)
+        reply = ask_claude(user, msg, market_data)
 
     add_history(user, msg, reply)
 
