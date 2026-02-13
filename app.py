@@ -147,4 +147,92 @@ You are a professional investment assistant.
     messages.append({"role": "user", "content": message})
 
     try:
-        r
+        response = client.chat.completions.create(
+            model="gpt-5",
+            messages=messages,
+            temperature=0.4,
+            max_tokens=350
+        )
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print(f"[GPT Error] {e}")
+        return "⚠️ AI kon je vraag niet verwerken."
+
+# ---------------- DAILY BRIEF ----------------
+
+def daily_brief():
+    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "BTC-USD"]
+    lines = ["📊 *Dagelijkse Marktupdate*\n"]
+
+    for t in tickers:
+        data = get_technical_data(t)
+        if data:
+            lines.append(
+                f"{data['trend']} *{t}*\n"
+                f"Prijs: ${data['price']}\n"
+                f"RSI: {data['rsi']}\n"
+            )
+
+    lines.append("⚠️ Dit is geen financieel advies.")
+    return "\n".join(lines)
+
+# ---------------- WHATSAPP ----------------
+
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp():
+    user = request.form.get("From")
+    msg_raw = request.form.get("Body")
+
+    if not user or not msg_raw:
+        return "OK"
+
+    msg = msg_raw.strip()
+    msg_lower = msg.lower()
+
+    reply = ""
+
+    try:
+        if msg_lower == "portfolio":
+            pf = get_portfolio(user)
+
+            if not pf:
+                reply = "📂 Je portfolio is leeg."
+            else:
+                reply = "📂 *Jouw Portfolio*\n"
+                for t, s in pf:
+                    reply += f"💹 {t}: {s} aandelen\n"
+
+        elif msg_lower.startswith("koop"):
+            parts = msg.split()
+
+            if len(parts) != 3:
+                reply = "Gebruik: koop <TICKER> <AANTAL>"
+            else:
+                ticker = parts[1].upper()
+                shares = float(parts[2])
+                add_to_portfolio(user, ticker, shares)
+                reply = f"✅ {shares} aandelen {ticker} toegevoegd."
+
+        elif msg_lower == "brief":
+            reply = daily_brief()
+
+        else:
+            words = [w.upper() for w in msg.split() if w.isalpha()]
+            market_data = get_technical_data(words[-1]) if words else None
+            reply = ask_gpt(user, msg, market_data)
+
+    except Exception as e:
+        print(f"[App Error] {e}")
+        reply = "⚠️ Er ging iets mis."
+
+    add_history(user, msg, reply)
+
+    resp = MessagingResponse()
+    send_long_message(resp, reply)
+    return str(resp)
+
+# ---------------- START ----------------
+
+if __name__ == "__main__":
+    app.run()
