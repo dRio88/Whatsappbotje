@@ -12,11 +12,11 @@ from twilio.twiml.messaging_response import MessagingResponse
 # ---------------- CONFIG ----------------
 
 app = Flask(__name__)
-MAX_MESSAGE_CHARS = 900
+MAX_MESSAGE_CHARS = 900      # Twilio safe chunk size
 DEFAULT_HISTORY_LIMIT = 8
 BRIEF_TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "BTC-USD"]
 COMMANDS = {"KOOP", "PORTFOLIO", "BRIEF", "HELP"}
-MAX_AI_REPLY_CHARS = 1500  # verhoogd voor langere analyses
+MAX_AI_REPLY_CHARS = 3000    # totale max, wordt in chunks verstuurd
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -46,26 +46,22 @@ def get_cursor():
 
 def init_db():
     with get_cursor() as c:
-        c.execute(
-            """
+        c.execute("""
             CREATE TABLE IF NOT EXISTS portfolios (
                 user_id TEXT,
                 ticker TEXT,
                 shares DOUBLE PRECISION,
                 PRIMARY KEY(user_id, ticker)
             );
-            """
-        )
-        c.execute(
-            """
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 user_id TEXT,
                 user_msg TEXT,
                 bot_msg TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
-            """
-        )
+        """)
 
 init_db()
 
@@ -77,7 +73,13 @@ def chunk_message(text: str, max_len: int = MAX_MESSAGE_CHARS):
     return [text[i : i + max_len] for i in range(0, len(text), max_len)]
 
 def send_long_message(resp, text):
-    for chunk in chunk_message(text):
+    """
+    Stuur alle chunks via Twilio. Eerste chunk resp.message, volgende ook apart.
+    """
+    if not text:
+        return
+    chunks = chunk_message(text, MAX_MESSAGE_CHARS)
+    for chunk in chunks:
         resp.message(chunk)
 
 def shorten_reply(text: str, limit: int = MAX_AI_REPLY_CHARS):
@@ -89,7 +91,7 @@ def shorten_reply(text: str, limit: int = MAX_AI_REPLY_CHARS):
 def add_history(user_id, user_msg, bot_msg):
     with get_cursor() as c:
         c.execute(
-            "INSERT INTO history(user_id, user_msg, bot_msg, created_at) VALUES(%s, %s, %s, %s)",
+            "INSERT INTO history(user_id, user_msg, bot_msg, created_at) VALUES(%s,%s,%s,%s)",
             (user_id, user_msg, bot_msg, datetime.utcnow()),
         )
 
@@ -135,22 +137,16 @@ def detect_ticker_from_text(message):
 
 def add_to_portfolio(user_id, ticker, shares):
     with get_cursor() as c:
-        c.execute(
-            """
+        c.execute("""
             INSERT INTO portfolios(user_id, ticker, shares)
-            VALUES(%s, %s, %s)
+            VALUES(%s,%s,%s)
             ON CONFLICT(user_id, ticker)
             DO UPDATE SET shares = portfolios.shares + EXCLUDED.shares;
-            """,
-            (user_id, ticker, shares),
-        )
+        """, (user_id, ticker, shares))
 
 def get_portfolio(user_id):
     with get_cursor() as c:
-        c.execute(
-            "SELECT ticker, shares FROM portfolios WHERE user_id=%s ORDER BY ticker ASC",
-            (user_id,),
-        )
+        c.execute("SELECT ticker, shares FROM portfolios WHERE user_id=%s ORDER BY ticker ASC", (user_id,))
         return c.fetchall()
 
 # ---------------- MARKET DATA ----------------
@@ -176,10 +172,10 @@ def get_technical_data(ticker):
         trend = "📈 bullish" if close.iloc[-1] > sma50.iloc[-1] else "📉 bearish"
         return {
             "ticker": ticker,
-            "price": round(float(close.iloc[-1]), 2),
-            "rsi": round(float(rsi[-1]), 1),
-            "sma20": round(float(sma20.iloc[-1]), 2) if not np.isnan(sma20.iloc[-1]) else None,
-            "sma50": round(float(sma50.iloc[-1]), 2) if not np.isnan(sma50.iloc[-1]) else None,
+            "price": round(float(close.iloc[-1]),2),
+            "rsi": round(float(rsi[-1]),1),
+            "sma20": round(float(sma20.iloc[-1]),2) if not np.isnan(sma20.iloc[-1]) else None,
+            "sma50": round(float(sma50.iloc[-1]),2) if not np.isnan(sma50.iloc[-1]) else None,
             "trend": trend,
         }
     except Exception as exc:
@@ -190,19 +186,17 @@ def get_technical_data(ticker):
 
 def build_system_prompt():
     return (
-        "You are a witty but responsible investment analysis assistant focused on portfolio insight and risk awareness. "
-        "You may explain trends, volatility, RSI/SMA interpretation, diversification, and scenario analysis. "
-        "Never provide guaranteed returns or direct buy/sell orders. "
-        "Always add a brief disclaimer that this is educational information, not financial advice. "
-        "Answer in the user's language, keep it practical, lightly funny."
+        "You are a witty but responsible investment assistant focused on portfolio insight and risk awareness. "
+        "Explain trends, RSI/SMA, diversification, and scenario analysis. "
+        "Never give guaranteed returns or direct buy/sell orders. "
+        "Always add a disclaimer. Answer practical, lightly funny, under 750 chars."
     )
 
 def build_user_prompt(message, market_data=None):
     if not market_data:
         return message
     return (
-        f"{message}\n\n"
-        "[Market Data]\n"
+        f"{message}\n\n[Market Data]\n"
         f"Ticker: {market_data['ticker']}\n"
         f"Price: ${market_data['price']}\n"
         f"RSI(14): {market_data['rsi']}\n"
@@ -223,6 +217,7 @@ def ask_gpt(user_id, message, market_data=None):
 
     prompt_text = build_user_prompt(message, market_data)
     conversation_text = "\n".join(history_lines + [f"User: {prompt_text}"])
+
     models_to_try = [OPENAI_MODEL] + [m for m in OPENAI_FALLBACK_MODELS if m != OPENAI_MODEL]
 
     for model_name in models_to_try:
@@ -230,21 +225,17 @@ def ask_gpt(user_id, message, market_data=None):
             response = client.responses.create(
                 model=model_name,
                 temperature=0.3,
-                max_output_tokens=600,
+                max_output_tokens=420,
                 input=[
-                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": conversation_text}]},
+                    {"role":"system","content":[{"type":"input_text","text":system_prompt}]},
+                    {"role":"user","content":[{"type":"input_text","text":conversation_text}]},
                 ],
             )
-            if getattr(response, "output_text", None):
+            if getattr(response,"output_text",None):
                 return response.output_text
         except Exception as exc:
             print(f"[Responses API Error][{model_name}] {exc}")
-
-    return (
-        "⚠️ AI kon je vraag niet verwerken. "
-        "Controleer OPENAI_MODEL/OPENAI_FALLBACK_MODELS of je API-toegang."
-    )
+    return "⚠️ AI kon je vraag niet verwerken."
 
 # ---------------- RESPONSE BUILDERS ----------------
 
@@ -266,10 +257,7 @@ def daily_brief():
             continue
         lines.append(
             f"{data['trend']} *{ticker}*\n"
-            f"Prijs: ${data['price']}\n"
-            f"RSI: {data['rsi']}\n"
-            f"SMA20: {data['sma20']}\n"
-            f"SMA50: {data['sma50']}\n"
+            f"Prijs: ${data['price']}\nRSI: {data['rsi']}\nSMA20: {data['sma20']}\nSMA50: {data['sma50']}\n"
         )
     lines.append("⚠️ Dit is geen financieel advies.")
     return "\n".join(lines)
@@ -277,11 +265,8 @@ def daily_brief():
 def help_text():
     return (
         "📚 *Beschikbare commando's*\n"
-        "• portfolio\n"
-        "• koop <TICKER> <AANTAL>\n"
-        "• brief\n"
-        "• help\n\n"
-        "Voor vrije vragen kun je bv sturen: 'Wat vind je van NVDA trend?'\n"
+        "• portfolio\n• koop <TICKER> <AANTAL>\n• brief\n• help\n\n"
+        "Vrije vragen bv: 'Wat vind je van NVDA trend?'\n"
         "Ik bijt niet, behalve in slechte risk/reward setups 😄"
     )
 
@@ -289,7 +274,7 @@ def help_text():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}, 200
+    return {"status":"ok"}, 200
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -297,14 +282,12 @@ def whatsapp():
     msg_raw = request.form.get("Body")
     if not user or not msg_raw:
         return "OK"
-
     msg = msg_raw.strip()
     msg_lower = msg.lower()
 
     try:
         if msg_lower == "portfolio":
             reply = format_portfolio(get_portfolio(user))
-
         elif msg_lower.startswith("koop"):
             try:
                 ticker, shares = parse_buy_command(msg)
@@ -312,19 +295,14 @@ def whatsapp():
                 reply = f"✅ {shares} aandelen {ticker} toegevoegd."
             except ValueError as exc:
                 reply = f"⚠️ {exc}"
-
         elif msg_lower == "brief":
             reply = daily_brief()
-
         elif msg_lower == "help":
             reply = help_text()
-
         else:
             ticker = detect_ticker_from_text(msg)
             market_data = get_technical_data(ticker) if ticker else None
-            ai_reply = ask_gpt(user, msg, market_data)
-            reply = shorten_reply(ai_reply, limit=MAX_AI_REPLY_CHARS)
-
+            reply = shorten_reply(ask_gpt(user, msg, market_data))
     except Exception as exc:
         print(f"[App Error] {exc}")
         reply = "⚠️ Er ging iets mis. Probeer later opnieuw."
@@ -338,8 +316,6 @@ def whatsapp():
     send_long_message(twiml, reply)
     return str(twiml)
 
-# ---------------- MAIN ----------------
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT","5000"))
     app.run(host="0.0.0.0", port=port)
