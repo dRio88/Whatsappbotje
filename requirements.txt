@@ -1,9 +1,8 @@
 flask
-twilio
-anthropic>=0.7.0
 gunicorn
-yfinance
-pandas
-numpy
+openai
+twilio
 psycopg2-binary
-python-dotenv
+numpy
+yfinance
+requests
