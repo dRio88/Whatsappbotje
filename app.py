@@ -1,6 +1,6 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from anthropic import Anthropic
+from openai import OpenAI
 import requests
 import pandas as pd
 import numpy as np
@@ -12,8 +12,8 @@ from datetime import datetime
 app = Flask(__name__)
 MAX_LEN = 1500  # WhatsApp veilige limiet per bericht
 
-# Anthropic Claude setup
-client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+# OpenAI GPT-5 setup
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Postgres setup
 db = psycopg2.connect(os.environ["DATABASE_URL"])
@@ -50,7 +50,6 @@ def send_long_message(resp, text):
 
 # ---------------- BASE44 PORTFOLIO ----------------
 def fetch_base44_portfolio(user_id):
-    """Haalt portfolio op van Base44 API"""
     url = f"{BASE44_BASE_URL}/{BASE44_APP_ID}/functions/getPortfolio"
     headers = {
         "Content-Type": "application/json",
@@ -61,14 +60,12 @@ def fetch_base44_portfolio(user_id):
         resp = requests.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        # Base44 retourneert meestal 'data' of 'result'
         return data.get("data") or data.get("result")
     except Exception as e:
         print(f"[Base44 ERROR] {e}")
         return None
 
 def sync_portfolio(user_id):
-    """Sync Base44 portfolio naar lokale Postgres"""
     items = fetch_base44_portfolio(user_id)
     if not items:
         return
@@ -98,56 +95,72 @@ def get_technical_data(ticker):
     try:
         import yfinance as yf
         df = yf.Ticker(ticker).history(period="3mo")
-        if df.empty or len(df) < 20: 
+        if df.empty or len(df) < 20:
             return None
+
         close = df["Close"]
         delta = close.diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
+
         avg_gain = gain.ewm(com=13, adjust=False).mean()
         avg_loss = loss.ewm(com=13, adjust=False).mean()
-        rs = np.where(avg_loss==0, np.inf, avg_gain/avg_loss)
-        rsi = 100 - (100 / (1+rs))
+        rs = np.where(avg_loss == 0, np.inf, avg_gain / avg_loss)
+        rsi = 100 - (100 / (1 + rs))
+
         sma50 = close.rolling(50).mean()
         trend = "📈 bullish" if close.iloc[-1] > sma50.iloc[-1] else "📉 bearish"
-        return {"price": round(close.iloc[-1],2), "rsi": round(rsi[-1],1), "trend": trend}
+
+        return {
+            "price": round(close.iloc[-1], 2),
+            "rsi": round(float(rsi[-1]), 1),
+            "trend": trend
+        }
     except:
         return None
 
-# ---------------- CLAUDE HAIKU ----------------
-def ask_claude(user_id, message, market_data=None):
+# ---------------- GPT-5 ----------------
+def ask_gpt(user_id, message, market_data=None):
     system_prompt = """You are a professional investment assistant.
 IMPORTANT:
 - Use only the provided market data.
 - Do NOT provide financial advice.
 - Keep responses concise and helpful.
 - Respond in the user's language if possible."""
-    
-    messages = []
-    
-    # Add conversation history
+
+    history_messages = []
+
     for u, b in get_history(user_id, 5):
-        messages.append({"role": "user", "content": u})
-        messages.append({"role": "assistant", "content": b})
-    
-    # Add market data context if available
+        history_messages.append({"role": "user", "content": u})
+        history_messages.append({"role": "assistant", "content": b})
+
     user_message = message
     if market_data:
-        user_message += f"\n\n[Market Data]\nPrice: ${market_data['price']}\nRSI: {market_data['rsi']}\nTrend: {market_data['trend']}"
-    
-    messages.append({"role": "user", "content": user_message})
-    
-    try:
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=350,
-            system=system_prompt,
-            messages=messages
+        user_message += (
+            f"\n\n[Market Data]\n"
+            f"Price: ${market_data['price']}\n"
+            f"RSI: {market_data['rsi']}\n"
+            f"Trend: {market_data['trend']}"
         )
-        return response.content[0].text
+
+    history_messages.append({"role": "user", "content": user_message})
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *history_messages
+            ],
+            max_tokens=350,
+            temperature=0.4
+        )
+
+        return response.choices[0].message.content
+
     except Exception as e:
-        print(f"[Claude ERROR] {e}")
-        return "⚠️ AI could not process your request."
+        print(f"[GPT ERROR] {e}")
+        return "⚠️ AI kon je vraag niet verwerken."
 
 # ---------------- DAILY BRIEF ----------------
 def daily_brief():
@@ -163,11 +176,17 @@ def daily_brief():
 # ---------------- CHAT HISTORY ----------------
 def add_history(user_id, u_msg, b_msg):
     with db.cursor() as c:
-        c.execute("INSERT INTO history(user_id,user_msg,bot_msg,created_at) VALUES(%s,%s,%s,%s)", (user_id,u_msg,b_msg,datetime.now()))
+        c.execute(
+            "INSERT INTO history(user_id,user_msg,bot_msg,created_at) VALUES(%s,%s,%s,%s)",
+            (user_id, u_msg, b_msg, datetime.now())
+        )
 
 def get_history(user_id, limit):
     with db.cursor() as c:
-        c.execute("SELECT user_msg,bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",(user_id,limit))
+        c.execute(
+            "SELECT user_msg,bot_msg FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            (user_id, limit)
+        )
         return c.fetchall()[::-1]
 
 # ---------------- WHATSAPP ----------------
@@ -191,24 +210,4 @@ def whatsapp():
         try:
             _, ticker, shares = msg.split()
             add_to_portfolio(user, ticker.upper(), float(shares))
-            reply = f"✅ {shares} aandelen {ticker.upper()} toegevoegd."
-        except:
-            reply = "Gebruik: koop <TICKER> <AANTAL>"
-
-    elif msg == "brief":
-        reply = daily_brief()
-
-    else:
-        words = [w.upper() for w in msg.split() if w.isalpha()]
-        market_data = get_technical_data(words[-1]) if words else None
-        reply = ask_claude(user, msg, market_data)
-
-    add_history(user, msg, reply)
-
-    resp = MessagingResponse()
-    send_long_message(resp, reply)
-    return str(resp)
-
-# ---------------- START ----------------
-if __name__ == "__main__":
-    app.run(debug=True)
+            reply = f"✅ {shares} aandelen {ticker.upper(
