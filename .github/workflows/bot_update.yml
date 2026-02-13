@@ -1,0 +1,22 @@
+name: Bot Auto Update
+
+on:
+  push:
+    paths:
+      - 'generated/**'   # trigger als iets in generated/ verandert
+
+jobs:
+  push_to_github:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run auto-update script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python auto_update_github.py
