@@ -1,0 +1,5 @@
+// backend/getPortfolio.ts
+import { getPortfolio } from 'npm:base44-etoro-backend-functions-infra@1.1.7';
+
+// Exposeer de functie via Deno
+Deno.serve(getPortfolio);
