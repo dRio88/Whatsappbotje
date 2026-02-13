@@ -11,7 +11,7 @@ if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
 fi
 
 echo "Triggering Render deployment..."
-curl -X POST "$RENDER_DEPLOY_HOOK_URL"
+curl -X POST -f "$RENDER_DEPLOY_HOOK_URL"
 
 if [ $? -eq 0 ]; then
     echo "Deployment triggered successfully!"
